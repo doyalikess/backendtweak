@@ -167,7 +167,7 @@ app.get("/health", (req, res) => {
 
 app.post("/api/create-checkout", async (req, res) => {
   try {
-    const price = isTestMode ? 50 : 1499;
+    const price = 50;
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
