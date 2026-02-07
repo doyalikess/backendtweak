@@ -115,7 +115,7 @@ app.post('/api/create-checkout', async (req, res) => {
                         name: 'Tweakr Pro - Lifetime License',
                         description: 'HWID-locked FPS optimization tool for Windows 10/11',
                     },
-                    unit_amount: 0050, // $0.50
+                    unit_amount: 1499, // $14.99
                 },
                 quantity: 1,
             }],
