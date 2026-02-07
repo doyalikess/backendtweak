@@ -4,8 +4,7 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-const sqlite3 = require("sqlite3").verbose();
-const { open } = require("sqlite");
+const { Pool } = require("pg"); // Changed from sqlite3 to pg
 const Stripe = require("stripe");
 
 const app = express();
@@ -13,7 +12,6 @@ const app = express();
 // -------------------- CONFIG --------------------
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
-const DATABASE_PATH = process.env.DATABASE_URL || "./licenses.db";
 const PORT = process.env.PORT || 3000;
 
 if (!STRIPE_SECRET_KEY) {
@@ -23,35 +21,47 @@ if (!STRIPE_SECRET_KEY) {
 const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 const isTestMode = STRIPE_SECRET_KEY.startsWith("sk_test_");
 
-// -------------------- DB --------------------
-let db;
+// -------------------- POSTGRESQL SETUP --------------------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || "postgresql://tweakr_db_user:3XwJoMz3SQBh7HsQh6mMnlkTAxB20jiF@dpg-d63n4cer433s73d459eg-a/tweakr_db",
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+// Test database connection
+pool.connect((err, client, release) => {
+  if (err) {
+    console.error('Error acquiring client', err.stack);
+  } else {
+    console.log('Connected to PostgreSQL database');
+    release();
+  }
+});
 
 async function initDB() {
-  db = await open({
-    filename: DATABASE_PATH,
-    driver: sqlite3.Database,
-  });
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS licenses (
+        id SERIAL PRIMARY KEY,
+        license_key VARCHAR(100) UNIQUE NOT NULL,
+        session_id VARCHAR(100) UNIQUE NOT NULL,
+        customer_email VARCHAR(255),
+        amount_total INTEGER,
+        currency VARCHAR(10),
+        hwid VARCHAR(100),
+        activated BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
 
-  await db.exec(`
-    PRAGMA journal_mode = WAL;
-
-    CREATE TABLE IF NOT EXISTS licenses (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      license_key TEXT UNIQUE NOT NULL,
-      session_id TEXT UNIQUE NOT NULL,
-      customer_email TEXT,
-      amount_total INTEGER,
-      currency TEXT,
-      hwid TEXT,
-      activated INTEGER DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_licenses_session_id ON licenses(session_id);
-    CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key);
-  `);
-
-  console.log("DB ready:", DATABASE_PATH);
+      CREATE INDEX IF NOT EXISTS idx_licenses_session_id ON licenses(session_id);
+      CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key);
+      CREATE INDEX IF NOT EXISTS idx_licenses_hwid ON licenses(hwid);
+    `);
+    console.log("PostgreSQL database tables ready");
+  } catch (err) {
+    console.error("Database initialization error:", err);
+  }
 }
 
 function generateLicenseKey() {
@@ -76,7 +86,6 @@ app.use(
 );
 
 // -------------------- STRIPE WEBHOOK (RAW BODY ONLY) --------------------
-// Put this route BEFORE express.json()
 app.post(
   "/webhook/stripe",
   express.raw({ type: "application/json" }),
@@ -109,17 +118,17 @@ app.post(
         const currency = session.currency || null;
 
         // Idempotency: if it exists, do nothing
-        const existing = await db.get(
-          "SELECT license_key FROM licenses WHERE session_id = ?",
+        const existing = await pool.query(
+          "SELECT license_key FROM licenses WHERE session_id = $1",
           [sessionId]
         );
 
-        if (!existing) {
+        if (existing.rows.length === 0) {
           const licenseKey = generateLicenseKey();
 
-          await db.run(
+          await pool.query(
             `INSERT INTO licenses (license_key, session_id, customer_email, amount_total, currency)
-             VALUES (?, ?, ?, ?, ?)`,
+             VALUES ($1, $2, $3, $4, $5)`,
             [licenseKey, sessionId, email, amountTotal, currency]
           );
 
@@ -150,19 +159,31 @@ app.get("/", (req, res) => {
         <h2>Tweakr License Server</h2>
         <p>Status: ONLINE</p>
         <p>Mode: ${isTestMode ? "TEST" : "LIVE"}</p>
+        <p>Database: PostgreSQL</p>
         <p><a href="/health">/health</a></p>
       </body>
     </html>
   `);
 });
 
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    mode: isTestMode ? "test" : "live",
-    db: !!db,
-    timestamp: new Date().toISOString(),
-  });
+app.get("/health", async (req, res) => {
+  try {
+    // Test database connection
+    await pool.query("SELECT 1");
+    res.json({
+      status: "ok",
+      mode: isTestMode ? "test" : "live",
+      db: "postgresql",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      db: "postgresql",
+      error: err.message,
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
 app.post("/api/create-checkout", async (req, res) => {
@@ -207,12 +228,12 @@ app.post("/api/create-checkout", async (req, res) => {
 
 app.get("/api/license/:sessionId", async (req, res) => {
   try {
-    const row = await db.get(
-      "SELECT license_key, created_at FROM licenses WHERE session_id = ?",
+    const result = await pool.query(
+      "SELECT license_key, created_at FROM licenses WHERE session_id = $1",
       [req.params.sessionId]
     );
 
-    if (!row) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         error: "License not found",
@@ -221,8 +242,8 @@ app.get("/api/license/:sessionId", async (req, res) => {
 
     res.json({
       success: true,
-      license_key: row.license_key,
-      created_at: row.created_at,
+      license_key: result.rows[0].license_key,
+      created_at: result.rows[0].created_at,
     });
   } catch (err) {
     console.error("get-license error:", err);
@@ -239,13 +260,15 @@ app.post("/api/activate", async (req, res) => {
       return res.json({ success: false, error: "Missing license_key or hwid" });
     }
 
-    const row = await db.get("SELECT * FROM licenses WHERE license_key = ?", [
+    const result = await pool.query("SELECT * FROM licenses WHERE license_key = $1", [
       license_key,
     ]);
 
-    if (!row) {
+    if (result.rows.length === 0) {
       return res.json({ success: false, error: "Invalid license key" });
     }
+
+    const row = result.rows[0];
 
     if (row.activated && row.hwid !== hwid) {
       return res.json({
@@ -255,8 +278,8 @@ app.post("/api/activate", async (req, res) => {
     }
 
     if (!row.activated) {
-      await db.run(
-        "UPDATE licenses SET hwid = ?, activated = 1 WHERE license_key = ?",
+      await pool.query(
+        "UPDATE licenses SET hwid = $1, activated = true WHERE license_key = $2",
         [hwid, license_key]
       );
     }
@@ -270,13 +293,13 @@ app.post("/api/activate", async (req, res) => {
 
 app.get("/api/admin/licenses", async (req, res) => {
   try {
-    const rows = await db.all(
+    const result = await pool.query(
       `SELECT license_key, session_id, customer_email, amount_total, currency, activated, hwid, created_at
        FROM licenses
        ORDER BY id DESC
        LIMIT 100`
     );
-    res.json({ count: rows.length, licenses: rows });
+    res.json({ count: result.rows.length, licenses: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -288,6 +311,7 @@ initDB()
     app.listen(PORT, () => {
       console.log("Server up on port:", PORT);
       console.log("Mode:", isTestMode ? "TEST" : "LIVE");
+      console.log("Database: PostgreSQL");
     });
   })
   .catch((err) => {
