@@ -126,7 +126,7 @@ app.post('/api/create-checkout', async (req, res) => {
                 quantity: 1,
             }],
             mode: 'payment',
-            success_url: 'https://tweakr.store/#download?success=true&session_id={CHECKOUT_SESSION_ID}',
+            success_url: 'https://tweakr.store/#download?success=true&session_id={CHECKOUT_SESSION_ID}&t=' + Date.now(),
             cancel_url: 'https://tweakr.store/#download?canceled=true',
         });
 
