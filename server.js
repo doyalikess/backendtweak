@@ -151,7 +151,7 @@ app.post('/api/create-checkout', async (req, res) => {
 
 // ==================== FIXED WEBHOOK HANDLER ====================
 app.post('/webhook/stripe', 
-    // Middleware to capture RAW body (VERY IMPORTANT!)
+    // Middleware to capture RAW body
     (req, res, next) => {
         let rawBody = '';
         req.on('data', chunk => {
@@ -165,77 +165,55 @@ app.post('/webhook/stripe',
     
     // Webhook handler
     async (req, res) => {
-        console.log('🔔 Webhook received, body length:', req.rawBody?.length || 0);
+        console.log('🔔 Webhook received, responding immediately...');
         
         const sig = req.headers['stripe-signature'];
         const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
         
-        if (!sig) {
-            console.error('❌ No Stripe signature header');
-            return res.status(400).json({ error: 'No signature header' });
-        }
+        // RESPOND IMMEDIATELY to prevent timeout
+        res.json({ 
+            received: true,
+            processing: 'License generation in progress...'
+        });
         
-        if (!webhookSecret) {
-            console.error('❌ No webhook secret configured');
-            return res.status(500).json({ error: 'Webhook secret not configured' });
-        }
-        
-        let event;
-        
+        // Now verify and process (after responding)
         try {
-            // VERIFY WITH RAW BODY (not req.body!)
-            event = stripe.webhooks.constructEvent(
-                req.rawBody,  // RAW string from middleware
+            if (!sig || !webhookSecret) {
+                console.error('Missing signature or secret');
+                return;
+            }
+            
+            const event = stripe.webhooks.constructEvent(
+                req.rawBody,
                 sig,
                 webhookSecret
             );
             
             console.log(`✅ ${isTestMode ? 'TEST' : 'LIVE'} Webhook verified: ${event.type}`);
             
-            // Handle successful payment
             if (event.type === 'checkout.session.completed') {
                 const session = event.data.object;
                 console.log(`💳 Payment completed: ${session.id}`);
-                console.log(`📧 Customer: ${session.customer_details?.email || 'unknown'}`);
-                console.log(`💰 Amount: $${session.amount_total / 100}`);
                 
-                // Generate license key
+                // Generate license (fast operation)
                 const licenseKey = generateLicenseKey();
                 console.log(`🎫 License generated: ${licenseKey}`);
                 
-                // Save to database
+                // Async database save (don't wait for it)
                 if (db) {
-                    try {
-                        await db.run(
-                            `INSERT INTO licenses (license_key, session_id, customer_email) VALUES (?, ?, ?)`,
-                            [licenseKey, session.id, session.customer_details?.email || 'unknown@test.com']
-                        );
+                    db.run(
+                        `INSERT INTO licenses (license_key, session_id, customer_email) VALUES (?, ?, ?)`,
+                        [licenseKey, session.id, session.customer_details?.email || 'unknown@test.com']
+                    ).then(() => {
                         console.log('💾 License saved to database');
-                    } catch (dbError) {
-                        console.error('❌ Database save error:', dbError.message);
-                    }
-                } else {
-                    console.error('❌ Database not available');
+                    }).catch(err => {
+                        console.error('❌ Database error:', err.message);
+                    });
                 }
             }
             
-            res.json({ 
-                received: true, 
-                verified: true,
-                event: event.type 
-            });
-            
         } catch (err) {
-            console.error('❌ Webhook verification failed:', err.message);
-            console.error('Signature header:', sig);
-            console.error('Secret configured:', !!webhookSecret);
-            console.error('Raw body preview:', req.rawBody?.substring(0, 200));
-            
-            res.status(400).json({ 
-                error: 'Webhook verification failed',
-                message: err.message,
-                tip: 'Make sure you are using the correct webhook secret for test/live mode'
-            });
+            console.error('❌ Webhook processing error:', err.message);
         }
     }
 );
