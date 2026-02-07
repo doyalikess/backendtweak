@@ -149,71 +149,73 @@ app.post('/api/create-checkout', async (req, res) => {
     }
 });
 
-// ==================== FIXED WEBHOOK HANDLER ====================
+// ==================== SIMPLE WORKING WEBHOOK ====================
 app.post('/webhook/stripe', 
-    // Middleware to capture RAW body
+    // Capture raw body
     (req, res, next) => {
-        let rawBody = '';
+        let data = '';
         req.on('data', chunk => {
-            rawBody += chunk;
+            data += chunk;
         });
         req.on('end', () => {
-            req.rawBody = rawBody;
+            req.rawBody = data;
             next();
         });
     },
     
-    // Webhook handler
     async (req, res) => {
-        console.log('🔔 Webhook received, responding immediately...');
+        console.log('🎯 WEBHOOK RECEIVED - Length:', req.rawBody?.length || 0);
         
-        const sig = req.headers['stripe-signature'];
-        const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+        // Send immediate response
+        res.json({ received: true, status: 'processing' });
         
-        // RESPOND IMMEDIATELY to prevent timeout
-        res.json({ 
-            received: true,
-            processing: 'License generation in progress...'
-        });
-        
-        // Now verify and process (after responding)
         try {
+            const sig = req.headers['stripe-signature'];
+            const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+            
             if (!sig || !webhookSecret) {
-                console.error('Missing signature or secret');
+                console.error('❌ Missing signature or secret');
                 return;
             }
             
+            // Verify webhook
             const event = stripe.webhooks.constructEvent(
                 req.rawBody,
                 sig,
                 webhookSecret
             );
             
-            console.log(`✅ ${isTestMode ? 'TEST' : 'LIVE'} Webhook verified: ${event.type}`);
+            console.log(`✅ Webhook verified: ${event.type}`);
             
+            // Handle payment success
             if (event.type === 'checkout.session.completed') {
                 const session = event.data.object;
-                console.log(`💳 Payment completed: ${session.id}`);
+                console.log(`💰 Payment completed: ${session.id}`);
+                console.log(`📧 Email: ${session.customer_details?.email || 'unknown'}`);
+                console.log(`💵 Amount: $${session.amount_total / 100}`);
                 
-                // Generate license (fast operation)
+                // Generate license
                 const licenseKey = generateLicenseKey();
-                console.log(`🎫 License generated: ${licenseKey}`);
+                console.log(`🔑 License generated: ${licenseKey}`);
                 
-                // Async database save (don't wait for it)
+                // SAVE TO DATABASE (SYNC - NO ASYNC)
                 if (db) {
                     db.run(
                         `INSERT INTO licenses (license_key, session_id, customer_email) VALUES (?, ?, ?)`,
-                        [licenseKey, session.id, session.customer_details?.email || 'unknown@test.com']
-                    ).then(() => {
-                        console.log('💾 License saved to database');
-                    }).catch(err => {
-                        console.error('❌ Database error:', err.message);
-                    });
+                        [licenseKey, session.id, session.customer_details?.email || 'unknown@test.com'],
+                        function(err) {
+                            if (err) {
+                                console.error('❌ Database error:', err.message);
+                            } else {
+                                console.log(`💾 License saved! ID: ${this.lastID}`);
+                                console.log(`📋 License: ${licenseKey} for session: ${session.id}`);
+                            }
+                        }
+                    );
                 }
             }
-            
-        } catch (err) {
-            console.error('❌ Webhook processing error:', err.message);
+        } catch (error) {
+            console.error('❌ Webhook error:', error.message);
         }
     }
 );
