@@ -7,20 +7,23 @@ const Stripe = require('stripe');
 
 const app = express();
 
-// ==================== FIX 1: CORS ====================
+// ==================== CORS SETUP ====================
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+// ==================== REGULAR MIDDLEWARE ====================
+// IMPORTANT: express.json() for normal routes
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ==================== FIX 2: INITIALIZE STRIPE ====================
+// ==================== STRIPE SETUP ====================
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_xxxx');
+const isTestMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_test_');
 
-// ==================== FIX 3: DATABASE SETUP ====================
+// ==================== DATABASE SETUP ====================
 let db;
 async function initDB() {
     try {
@@ -41,16 +44,14 @@ async function initDB() {
             )
         `);
         
-        console.log('✅ Database initialized successfully');
+        console.log('✅ Database initialized');
     } catch (error) {
         console.error('❌ Database error:', error);
     }
 }
-
-// Initialize database
 initDB();
 
-// ==================== FIX 4: GENERATE LICENSE KEY ====================
+// ==================== LICENSE GENERATION ====================
 function generateLicenseKey() {
     const prefix = 'TWEAK';
     const random = crypto.randomBytes(6).toString('hex').toUpperCase();
@@ -58,17 +59,17 @@ function generateLicenseKey() {
     return `${prefix}-${random}-${checksum}`;
 }
 
-// ==================== FIX 5: HEALTH CHECK (MUST COME FIRST) ====================
+// ==================== HEALTH CHECK ====================
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         service: 'Tweakr License Server',
-        timestamp: new Date().toISOString(),
-        version: '1.0.0'
+        mode: isTestMode ? 'test' : 'live',
+        timestamp: new Date().toISOString()
     });
 });
 
-// ==================== FIX 6: HOME PAGE ====================
+// ==================== HOME PAGE ====================
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -80,6 +81,7 @@ app.get('/', (req, res) => {
         <body>
             <h1>🎮 Tweakr License Server</h1>
             <p><strong>Status: <span style="color:green;">● ONLINE</span></strong></p>
+            <p>Mode: <strong>${isTestMode ? 'TEST' : 'LIVE'}</strong></p>
             <p>Server is running and ready to process payments.</p>
             <p><a href="/health">Health Check</a> | <a href="/test">Test Endpoint</a></p>
         </body>
@@ -87,10 +89,11 @@ app.get('/', (req, res) => {
     `);
 });
 
-// ==================== FIX 7: TEST ENDPOINT ====================
+// ==================== TEST ENDPOINT ====================
 app.get('/test', (req, res) => {
     res.json({
         message: 'Server is working!',
+        mode: isTestMode ? 'test' : 'live',
         endpoints: {
             health: 'GET /health',
             createCheckout: 'POST /api/create-checkout',
@@ -101,21 +104,24 @@ app.get('/test', (req, res) => {
     });
 });
 
-// ==================== FIX 8: CREATE CHECKOUT ====================
+// ==================== CREATE CHECKOUT ====================
 app.post('/api/create-checkout', async (req, res) => {
     console.log('📦 Creating checkout session...');
     
     try {
+        // Use $0.50 for testing, $14.99 for real
+        const price = isTestMode ? 50 : 1499; // $0.50 test, $14.99 live
+        
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
             line_items: [{
                 price_data: {
                     currency: 'usd',
                     product_data: {
-                        name: 'Tweakr Pro - Lifetime License',
+                        name: isTestMode ? 'Tweakr Pro - TEST ($0.50)' : 'Tweakr Pro - Lifetime License',
                         description: 'HWID-locked FPS optimization tool for Windows 10/11',
                     },
-                    unit_amount: 50, // $0.5
+                    unit_amount: price,
                 },
                 quantity: 1,
             }],
@@ -124,12 +130,14 @@ app.post('/api/create-checkout', async (req, res) => {
             cancel_url: 'https://tweakr.store/#download?canceled=true',
         });
 
-        console.log('✅ Checkout session created:', session.id);
+        console.log(`✅ Checkout session created: ${session.id} ($${price/100})`);
         
         res.json({ 
             success: true, 
             url: session.url,
-            sessionId: session.id
+            sessionId: session.id,
+            mode: isTestMode ? 'test' : 'live',
+            amount: price / 100
         });
         
     } catch (error) {
@@ -141,49 +149,98 @@ app.post('/api/create-checkout', async (req, res) => {
     }
 });
 
-// ==================== FIX 9: WEBHOOK HANDLER ====================
-app.post('/webhook/stripe', express.raw({type: 'application/json'}), async (req, res) => {
-    console.log('🔔 Webhook received');
+// ==================== FIXED WEBHOOK HANDLER ====================
+app.post('/webhook/stripe', 
+    // Middleware to capture RAW body (VERY IMPORTANT!)
+    (req, res, next) => {
+        let rawBody = '';
+        req.on('data', chunk => {
+            rawBody += chunk;
+        });
+        req.on('end', () => {
+            req.rawBody = rawBody;
+            next();
+        });
+    },
     
-    const sig = req.headers['stripe-signature'];
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || 'whsec_xxxx';
-    
-    let event;
-    
-    try {
-        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-        console.log('✅ Webhook verified:', event.type);
-    } catch (err) {
-        console.error('❌ Webhook verification failed:', err.message);
-        return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-    
-    // Handle checkout.session.completed
-    if (event.type === 'checkout.session.completed') {
-        const session = event.data.object;
-        console.log('💳 Payment completed for session:', session.id);
+    // Webhook handler
+    async (req, res) => {
+        console.log('🔔 Webhook received, body length:', req.rawBody?.length || 0);
+        
+        const sig = req.headers['stripe-signature'];
+        const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+        
+        if (!sig) {
+            console.error('❌ No Stripe signature header');
+            return res.status(400).json({ error: 'No signature header' });
+        }
+        
+        if (!webhookSecret) {
+            console.error('❌ No webhook secret configured');
+            return res.status(500).json({ error: 'Webhook secret not configured' });
+        }
+        
+        let event;
         
         try {
-            const licenseKey = generateLicenseKey();
+            // VERIFY WITH RAW BODY (not req.body!)
+            event = stripe.webhooks.constructEvent(
+                req.rawBody,  // RAW string from middleware
+                sig,
+                webhookSecret
+            );
             
-            // Save to database
-            if (db) {
-                await db.run(
-                    `INSERT INTO licenses (license_key, session_id, customer_email) VALUES (?, ?, ?)`,
-                    [licenseKey, session.id, session.customer_details?.email || 'unknown']
-                );
-                console.log('✅ License saved:', licenseKey);
+            console.log(`✅ ${isTestMode ? 'TEST' : 'LIVE'} Webhook verified: ${event.type}`);
+            
+            // Handle successful payment
+            if (event.type === 'checkout.session.completed') {
+                const session = event.data.object;
+                console.log(`💳 Payment completed: ${session.id}`);
+                console.log(`📧 Customer: ${session.customer_details?.email || 'unknown'}`);
+                console.log(`💰 Amount: $${session.amount_total / 100}`);
+                
+                // Generate license key
+                const licenseKey = generateLicenseKey();
+                console.log(`🎫 License generated: ${licenseKey}`);
+                
+                // Save to database
+                if (db) {
+                    try {
+                        await db.run(
+                            `INSERT INTO licenses (license_key, session_id, customer_email) VALUES (?, ?, ?)`,
+                            [licenseKey, session.id, session.customer_details?.email || 'unknown@test.com']
+                        );
+                        console.log('💾 License saved to database');
+                    } catch (dbError) {
+                        console.error('❌ Database save error:', dbError.message);
+                    }
+                } else {
+                    console.error('❌ Database not available');
+                }
             }
             
-        } catch (dbError) {
-            console.error('❌ Database save error:', dbError);
+            res.json({ 
+                received: true, 
+                verified: true,
+                event: event.type 
+            });
+            
+        } catch (err) {
+            console.error('❌ Webhook verification failed:', err.message);
+            console.error('Signature header:', sig);
+            console.error('Secret configured:', !!webhookSecret);
+            console.error('Raw body preview:', req.rawBody?.substring(0, 200));
+            
+            res.status(400).json({ 
+                error: 'Webhook verification failed',
+                message: err.message,
+                tip: 'Make sure you are using the correct webhook secret for test/live mode'
+            });
         }
     }
-    
-    res.json({ received: true });
-});
+);
 
-// ==================== FIX 10: GET LICENSE ====================
+// ==================== GET LICENSE ====================
 app.get('/api/license/:sessionId', async (req, res) => {
     console.log('🔑 Getting license for session:', req.params.sessionId);
     
@@ -193,14 +250,15 @@ app.get('/api/license/:sessionId', async (req, res) => {
         }
         
         const license = await db.get(
-            'SELECT license_key FROM licenses WHERE session_id = ?',
+            'SELECT license_key, created_at FROM licenses WHERE session_id = ?',
             [req.params.sessionId]
         );
         
         if (license) {
             res.json({ 
                 success: true, 
-                license_key: license.license_key 
+                license_key: license.license_key,
+                created_at: license.created_at
             });
         } else {
             res.status(404).json({ 
@@ -217,7 +275,7 @@ app.get('/api/license/:sessionId', async (req, res) => {
     }
 });
 
-// ==================== FIX 11: ACTIVATE LICENSE ====================
+// ==================== ACTIVATE LICENSE ====================
 app.post('/api/activate', async (req, res) => {
     console.log('🔐 Activating license...');
     
@@ -264,7 +322,7 @@ app.post('/api/activate', async (req, res) => {
                 'UPDATE licenses SET hwid = ?, activated = 1 WHERE license_key = ?',
                 [hwid, license_key]
             );
-            console.log('✅ License activated:', license_key);
+            console.log('✅ License activated:', license_key, 'HWID:', hwid);
         }
         
         res.json({ 
@@ -282,7 +340,31 @@ app.post('/api/activate', async (req, res) => {
     }
 });
 
-// ==================== FIX 12: 404 HANDLER ====================
+// ==================== VIEW ALL LICENSES (ADMIN) ====================
+app.get('/api/admin/licenses', async (req, res) => {
+    try {
+        if (!db) {
+            return res.json({ error: 'Database not available' });
+        }
+        
+        const licenses = await db.all(`
+            SELECT license_key, session_id, customer_email, 
+                   activated, hwid, created_at 
+            FROM licenses 
+            ORDER BY id DESC
+            LIMIT 50
+        `);
+        
+        res.json({ 
+            count: licenses.length,
+            licenses: licenses 
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== 404 HANDLER ====================
 app.use((req, res) => {
     res.status(404).json({ 
         error: 'Endpoint not found',
@@ -293,24 +375,18 @@ app.use((req, res) => {
             'POST /api/create-checkout': 'Create Stripe checkout',
             'GET /api/license/:sessionId': 'Get license by session ID',
             'POST /api/activate': 'Activate license with HWID',
-            'POST /webhook/stripe': 'Stripe webhook'
+            'POST /webhook/stripe': 'Stripe webhook',
+            'GET /api/admin/licenses': 'View all licenses (admin)'
         }
     });
 });
 
-// ==================== FIX 13: ERROR HANDLER ====================
-app.use((error, req, res, next) => {
-    console.error('🚨 Server error:', error);
-    res.status(500).json({ 
-        error: 'Internal server error',
-        message: error.message 
-    });
-});
-
-// ==================== FIX 14: START SERVER ====================
+// ==================== START SERVER ====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Tweakr License Server running on port ${PORT}`);
-    console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-    console.log(`🔗 Test endpoint: http://localhost:${PORT}/test`);
+    console.log(`🔗 Mode: ${isTestMode ? 'TEST' : 'LIVE'}`);
+    console.log(`🔗 Health: http://localhost:${PORT}/health`);
+    console.log(`🔗 Test: http://localhost:${PORT}/test`);
+    console.log(`🔗 Admin: http://localhost:${PORT}/api/admin/licenses`);
 });
