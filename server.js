@@ -305,6 +305,144 @@ app.get("/api/admin/licenses", async (req, res) => {
   }
 });
 
+// ---------------- LICENSE API ----------------
+
+app.get("/api/licenses", async (req,res)=>{
+  try{
+    const result = await pool.query(
+      "SELECT * FROM licenses ORDER BY id DESC LIMIT 200"
+    );
+
+    res.json({
+      success:true,
+      count:result.rows.length,
+      licenses:result.rows
+    });
+
+  }catch(err){
+    res.status(500).json({success:false,error:err.message});
+  }
+});
+
+app.post("/api/licenses/add", async (req,res)=>{
+  try{
+    const { license_key, customer_email, hwid } = req.body;
+
+    if(!license_key){
+      return res.json({success:false,error:"Missing license_key"});
+    }
+
+    await pool.query(
+      `INSERT INTO licenses
+      (license_key,customer_email,hwid,activated)
+      VALUES($1,$2,$3,$4)`,
+      [license_key, customer_email||null, hwid||null, !!hwid]
+    );
+
+    res.json({success:true});
+
+  }catch(err){
+    res.status(500).json({success:false,error:err.message});
+  }
+});
+
+app.delete("/api/licenses/delete/:id", async (req,res)=>{
+  try{
+
+    const result = await pool.query(
+      "DELETE FROM licenses WHERE id=$1",
+      [req.params.id]
+    );
+
+    if(result.rowCount===0){
+      return res.json({success:false,error:"Not found"});
+    }
+
+    res.json({success:true});
+
+  }catch(err){
+    res.status(500).json({success:false,error:err.message});
+  }
+});
+
+app.post("/api/licenses/reset/:id", async (req,res)=>{
+  try{
+
+    await pool.query(
+      "UPDATE licenses SET hwid=NULL, activated=false WHERE id=$1",
+      [req.params.id]
+    );
+
+    res.json({success:true});
+
+  }catch(err){
+    res.status(500).json({success:false,error:err.message});
+  }
+});
+
+app.get("/api/license/:sessionId", async (req,res)=>{
+  try{
+    const result = await pool.query(
+      "SELECT license_key,created_at FROM licenses WHERE session_id=$1",
+      [req.params.sessionId]
+    );
+
+    if(result.rows.length===0){
+      return res.status(404).json({success:false,error:"Not found"});
+    }
+
+    res.json({
+      success:true,
+      license_key:result.rows[0].license_key,
+      created_at:result.rows[0].created_at
+    });
+
+  }catch(err){
+    res.status(500).json({success:false,error:"Server error"});
+  }
+});
+
+app.post("/api/activate", async (req,res)=>{
+  try{
+
+    const { license_key, hwid } = req.body;
+
+    if(!license_key || !hwid){
+      return res.json({success:false,error:"Missing fields"});
+    }
+
+    const result = await pool.query(
+      "SELECT * FROM licenses WHERE license_key=$1",
+      [license_key]
+    );
+
+    if(result.rows.length===0){
+      return res.json({success:false,error:"Invalid license"});
+    }
+
+    const row = result.rows[0];
+
+    if(row.activated && row.hwid !== hwid){
+      return res.json({
+        success:false,
+        error:"License locked to another PC"
+      });
+    }
+
+    if(!row.activated){
+      await pool.query(
+        "UPDATE licenses SET hwid=$1, activated=true WHERE license_key=$2",
+        [hwid,license_key]
+      );
+    }
+
+    res.json({success:true,message:"Activated"});
+
+  }catch(err){
+    res.status(500).json({success:false,error:"Server error"});
+  }
+});
+
 // -------------------- START --------------------
 initDB()
   .then(() => {
